@@ -895,6 +895,10 @@ var StoreOptions = {
         default: false,
         type: StoreTypes.Boolean
     },
+    'showExRaidRaidsOnly': {
+        default: false,
+        type: StoreTypes.Boolean
+    },
     'showExRaidGymsOnly': {
         default: false,
         type: StoreTypes.Boolean
@@ -956,6 +960,10 @@ var StoreOptions = {
         type: StoreTypes.Boolean
     },
     'showPokemonStats': {
+        default: true,
+        type: StoreTypes.Boolean
+    },
+    'showFind': {
         default: true,
         type: StoreTypes.Boolean
     },
@@ -1180,6 +1188,9 @@ var mapData = {
     s2cellsLv17: {},
     weatherAlerts: {}
 }
+
+// used by FindPane
+var fp_circled
 
 // Populated by a JSON request.
 var pokemonRarities = {}

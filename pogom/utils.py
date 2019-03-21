@@ -475,6 +475,9 @@ def get_args():
                               'environment and auto-upload to ' +
                               'hastebin.com.'),
                         action='store_true', default=False)
+    parser.add_argument('-nfp', '--no-find-pane',
+                        help=('Disallow users to search using the find pane.'),
+                        action='store_true', default=False)
     parser.add_argument('-exg', '--ex-gyms',
                         help=('Fetch OSM parks within geofence and flag ' +
                               'gyms that are candidates for EX raids. ' +
@@ -488,6 +491,9 @@ def get_args():
                         help=('File to define excluded areas inside scan ' +
                               'area. Regarded this as inverted geofence. ' +
                               'Can be combined with geofence-file.'),
+                        default='')
+    parser.add_argument('-dg', '--default-geofence',
+                        help=('Default Geofence name for pages & routes'),
                         default='')
     verbose = parser.add_mutually_exclusive_group()
     verbose.add_argument('-v',

@@ -131,18 +131,18 @@ class Pogom(Flask):
         self.json_encoder = CustomJSONEncoder
         self.route("/", methods=['GET'])(self.fullmap)
         self.route("/raids", methods=['GET'])(self.raidview)
-        self.route("/devices", methods=['GET'])(self.devicesview)
         self.route("/quests", methods=['GET'])(self.questview)
         self.route("/auth_callback", methods=['GET'])(self.auth_callback)
         self.route("/auth_logout", methods=['GET'])(self.auth_logout)
         self.route("/raw_data", methods=['GET'])(self.raw_data)
         self.route("/raw_raid", methods=['POST'])(self.raw_raid)
-        self.route("/raw_devices", methods=['POST'])(self.raw_devices)
         self.route("/raw_quests", methods=['POST'])(self.raw_quests)
 
         self.route("/loc", methods=['GET'])(self.loc)
 
         if not args.map_only:
+            self.route("/devices", methods=['GET'])(self.devicesview)
+            self.route("/raw_devices", methods=['POST'])(self.raw_devices)
             self.route("/webhook", methods=['GET', 'POST'])(self.webhook)
             self.route("/walk_spawnpoint", methods=['GET', 'POST'])(self.old_walk_spawnpoint)
             self.route("/walk_gpx", methods=['GET', 'POST'])(self.old_walk_gpx)
@@ -625,7 +625,14 @@ class Pogom(Flask):
                 deviceworker['latitude'] = lat
                 deviceworker['longitude'] = lng
 
-            self.save_device(deviceworker)
+            # Update PoGo version
+            pogoversion = re.sub(r'pokemongo/([^\ ]*).*', r'\1', request.headers.get('User-Agent', 'Unknown'))
+            if pogoversion != "" and pogoversion != deviceworker['pogoversion']:
+                log.info('Device {} updating pogoversion: {} => {}'.format(uuid, deviceworker['pogoversion'], pogoversion))
+                deviceworker['pogoversion'] = pogoversion
+                self.save_device(deviceworker, True)
+            else:
+                self.save_device(deviceworker)
 
             self.track_event('worker', 'sent', uuid)
 
@@ -636,7 +643,7 @@ class Pogom(Flask):
     def track_event(self, category, action, uuid='555', label=None):
         args = get_args()
 
-        if args.google_analytics_key == '':
+        if (args.google_analytics_key == '' or args.google_analytics_key == None):
             return
 
         last_message_sent = self.ga_alerts.get(uuid, {}).get(category, {}).get(action, {}).get('sent', None)
@@ -1296,6 +1303,8 @@ class Pogom(Flask):
                                                 float(fort['lastModifiedTimestampMs']),
                                             'raid_active_until':
                                                 raid_active_until,
+                                            'ex_raid_eligible':
+                                                fort.get('isExRaidEligible', False)
                                         })
 
                                         self.wh_update_queue.put(('gym', wh_gym))
@@ -1314,7 +1323,7 @@ class Pogom(Flask):
 
                                         self.wh_update_queue.put(('gym_details', webhook_data))
 
-                                    if 'raidInfo' in fort and not fort["raidInfo"].get('complete', False):
+                                    if 'raidInfo' in fort and not fort["raidInfo"].get('complete', False) and not fort["raidInfo"].get('isExclusive', False):
                                         raidinfo = fort["raidInfo"]
                                         raidpokemonid = raidinfo['raidPokemon']['pokemonId'] if 'raidPokemon' in raidinfo and 'pokemonId' in raidinfo['raidPokemon'] else None
                                         if raidpokemonid:
@@ -1361,6 +1370,10 @@ class Pogom(Flask):
                                                 'move_1': raidpokemonmove1 if raidpokemonmove1 else 0,
                                                 'move_2': raidpokemonmove2 if raidpokemonmove2 else 0,
                                                 'is_ex_raid_eligible':
+                                                    fort.get('isExRaidEligible', False),
+                                                'is_ex_eligible':
+                                                    fort.get('isExRaidEligible', False),
+                                                'ex_raid_eligible':
                                                     fort.get('isExRaidEligible', False),
                                                 'name': gym_name,
                                                 'description': gym_description,
@@ -1441,7 +1454,7 @@ class Pogom(Flask):
                     continue
 
                 playernickname = get_player_response_json.get("playerData", {}).get("username", "")
-                if playernickname != "" and playernickname != deviceworker["name"] and args.use_username and len(playernickname) < 100 and 'quest_' not in playernickname:
+                if playernickname != "" and playernickname != deviceworker["name"] and args.use_username and len(playernickname) < 16 and 'quest_' not in playernickname:
                     deviceworker["name"] = playernickname
                     self.save_device(deviceworker, True)
 
@@ -1526,6 +1539,10 @@ class Pogom(Flask):
                             float(fort["gymDisplay"].get('occupiedMillis', 0)),
                         'last_modified':
                             float(fort['lastModifiedTimestampMs']),
+                        'ex_raid_eligible':
+                            fort.get('isExRaidEligible', False),
+                        'is_ex_eligible':
+                            fort.get('isExRaidEligible', False)
                     })
 
                     self.wh_update_queue.put(('gym', wh_gym))
@@ -2120,13 +2137,14 @@ class Pogom(Flask):
             'custom_css': args.custom_css,
             'custom_js': args.custom_js,
             'devices': not args.no_devices,
+            'find_pane': not args.no_find_pane,
             'show_auth': True if args.user_auth else False
         }
 
         map_lat = self.current_location[0]
         map_lng = self.current_location[1]
 
-        geofences = request.args.get('geofences', '')
+        geofences = request.args.get('geofences', args.default_geofence)
         if not self.geofences:
             from .geofence import Geofences
             self.geofences = Geofences()
@@ -2160,7 +2178,7 @@ class Pogom(Flask):
         map_lat = self.current_location[0]
         map_lng = self.current_location[1]
 
-        geofences = request.args.get('geofences', '')
+        geofences = request.args.get('geofences', args.default_geofence)
 
         return render_template('raids.html',
                                lat=map_lat,
@@ -2187,7 +2205,7 @@ class Pogom(Flask):
         if not args.devices_page_accounts:
             needlogin = False
 
-        geofences = request.args.get('geofences', '')
+        geofences = request.args.get('geofences', args.default_geofence)
 
         return render_template('devices.html',
                                lat=map_lat,
@@ -2212,7 +2230,7 @@ class Pogom(Flask):
         map_lat = self.current_location[0]
         map_lng = self.current_location[1]
 
-        geofences = request.args.get('geofences', '')
+        geofences = request.args.get('geofences', args.default_geofence)
 
         return render_template('quests.html',
                                lat=map_lat,
@@ -3011,7 +3029,7 @@ class Pogom(Flask):
         if routename is None or routename == "":
             routename = uuid
 
-        if (deviceworker['fetching'] == 'walk_gpx' and deviceworker['route'] != routename and deviceworker['route'] != ''):
+        if (deviceworker['fetching'] == 'walk_gpx' and deviceworker.get('route', '') != routename and deviceworker.get('route', '') != ''):
             self.deviceschedules[uuid] = []
 
         if len(self.deviceschedules[uuid]) > 0:
@@ -3126,7 +3144,6 @@ class Pogom(Flask):
         maxpoints = request_json.get('maxpoints', False)
         geofence = request_json.get('geofence', "")
         no_overlap = request_json.get('no_overlap', False)
-        mapcontrolled = request_json.get('mapcontrolled', False)
         speed = request_json.get('speed', args.speed)
         arrived_range = request_json.get('arrived_range', args.arrived_range)
 
@@ -3171,14 +3188,6 @@ class Pogom(Flask):
                     no_overlap = True
                 else:
                     no_overlap = False
-            except:
-                pass
-        if not isinstance(mapcontrolled, bool):
-            try:
-                if mapcontrolled.lower() == 'true':
-                    mapcontrolled = True
-                else:
-                    mapcontrolled = False
             except:
                 pass
         if not isinstance(speed, (int, long)):
@@ -3460,7 +3469,7 @@ class Pogom(Flask):
                 self.deviceschedules[uuid] = Gym.get_nearby_gyms(latitude, longitude, maxradius, teleport_ignore, False, maxpoints, geofence, scheduled_points, self.geofences, exraidonly, oldest_first)
             if len(self.deviceschedules[uuid]) == 0:
                 return self.scan_loc(mapcontrolled, uuid, latitude, longitude, request_json)
-            
+
             self.devices_last_teleport_time[uuid] = dt_now
             self.save_device(deviceworker)
 
@@ -3561,7 +3570,7 @@ class Pogom(Flask):
         if routename is None or routename == "":
             routename = uuid
 
-        if (deviceworker['fetching'] == 'teleport_gpx' and deviceworker['route'] != routename and deviceworker['route'] != ''):
+        if (deviceworker['fetching'] == 'teleport_gpx' and deviceworker.get('route', '') != routename and deviceworker.get('route', '') != ''):
             self.deviceschedules[uuid] = []
 
         ls_times = self.devices_last_scanned_times.get(uuid)
@@ -3714,12 +3723,25 @@ class Pogom(Flask):
         # Update the username of the device is sent along and incorrect in database
         username = request_json.get('username', '')
         if username != "" and username != deviceworker['username']:
-            log.info('Device {} updating username: {} => {}'.format(uuid, deviceworker['username'], username))
+            log.info('Device {} updating ownerusername: {} => {}'.format(uuid, deviceworker['username'], username))
             deviceworker['username'] = username
             self.save_device(deviceworker, True)
         # Update deviceusername
         if devicename != "" and devicename != deviceworker['name']:
+            log.info('Device {} updating deviceusername: {} => {}'.format(uuid, deviceworker['name'], devicename))
             deviceworker['name'] = devicename
+            self.save_device(deviceworker, True)
+# Update deviceusername
+        requestedEndpoint = re.sub(r'((\?|\&)longitude=-?[0-9]*\.?[0-9]*)|((\?|\&)latitude=-?[0-9]*\.?[0-9]*)|((\?|\&)timestamp=[0-9]*\.[0-9]*)|((\?|\&)uuid=[A-F0-9-]{36})','',request.full_path)
+        if requestedEndpoint != "" and requestedEndpoint != deviceworker['requestedEndpoint']:
+            log.info('Device {} updating requestedEndpoint: {} => {}'.format(uuid, deviceworker['requestedEndpoint'], requestedEndpoint))
+            deviceworker['requestedEndpoint'] = requestedEndpoint
+            self.save_device(deviceworker, True)
+# Update PoGo version
+        pogoversion = re.sub(r'pokemongo/([^\ ]*).*', r'\1', request.headers.get('User-Agent','Unknown'))
+        if pogoversion != "" and pogoversion != deviceworker['pogoversion']:
+            log.info('Device {} updating pogoversion: {} => {}'.format(uuid, deviceworker['pogoversion'], pogoversion))
+            deviceworker['pogoversion'] = pogoversion
             self.save_device(deviceworker, True)
 #MapControlled section
         if (endpoint.lower() == "mapcontrolled"):

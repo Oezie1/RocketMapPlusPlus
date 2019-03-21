@@ -48,7 +48,7 @@ args = get_args()
 flaskDb = FlaskDB()
 cache = TTLCache(maxsize=100, ttl=60 * 5)
 
-db_schema_version = 61
+db_schema_version = 62
 
 
 class MyRetryDB(RetryOperationalError, PooledMySQLDatabase):
@@ -690,6 +690,10 @@ class Pokestop(LatLongModel):
             lat2 = lat + 0.1
             lng1 = lng - 0.1
             lng2 = lng + 0.1
+
+            if geofence_name != "":
+                lat1, lng1, lat2, lng2 = geofences.get_boundary_coords(geofence_name)
+
             minlat = min(lat1, lat2)
             maxlat = max(lat1, lat2)
             minlng = min(lng1, lng2)
@@ -719,18 +723,19 @@ class Pokestop(LatLongModel):
 
                 now_date = datetime.utcnow()
 
-                quests = (Quest
-                          .select(
-                              Quest.pokestop_id,
-                              Quest.quest_type,
-                              Quest.reward_type,
-                              Quest.reward_item,
-                              Quest.quest_json)
-                          .where((Quest.pokestop_id << pokestop_ids) & (Quest.expiration >= now_date))
-                          .dicts())
+                if len(pokestop_ids) > 0:
+                    quests = (Quest
+                              .select(
+                                  Quest.pokestop_id,
+                                  Quest.quest_type,
+                                  Quest.reward_type,
+                                  Quest.reward_item,
+                                  Quest.quest_json)
+                              .where((Quest.pokestop_id << pokestop_ids) & (Quest.expiration >= now_date))
+                              .dicts())
 
-                for q in quests:
-                    pokestop_quest_ids.append(q['pokestop_id'])
+                    for q in quests:
+                        pokestop_quest_ids.append(q['pokestop_id'])
 
             if len(queryDict) > 0 and geofences.is_enabled():
                 queryDict = geofences.get_geofenced_results(queryDict, geofence_name)
@@ -1047,18 +1052,16 @@ class Gym(LatLongModel):
         gyms = {}
         with Gym.database().execution_context():
             query = (Gym.select(
-                Gym.latitude, Gym.longitude, Gym.gym_id).dicts())
+                Gym.latitude, Gym.longitude, Gym.gym_id, Gym.last_scanned).dicts())
 
-            lat1 = lat - 0.1
-            lat2 = lat + 0.1
-            lng1 = lng - 0.1
-            lng2 = lng + 0.1
-            minlat = min(lat1, lat2)
-            maxlat = max(lat1, lat2)
-            minlng = min(lng1, lng2)
-            maxlng = max(lng1, lng2)
+            if geofence_name != "":
+                lat1, lng1, lat2, lng2 = geofences.get_boundary_coords(geofence_name)
 
-            if dist > 0:
+                minlat = min(lat1, lat2)
+                maxlat = max(lat1, lat2)
+                minlng = min(lng1, lng2)
+                maxlng = max(lng1, lng2)
+
                 query = (query
                          .where((Gym.latitude >= minlat) &
                                 (Gym.longitude >= minlng) &
@@ -1086,7 +1089,7 @@ class Gym(LatLongModel):
             for g in queryDict:
                 gym_ids.append(g['gym_id'])
 
-            if raidless:
+            if raidless and len(gym_ids) > 0:
                 raids = (Raid
                          .select()
                          .where(Raid.gym_id << gym_ids)
@@ -1103,9 +1106,9 @@ class Gym(LatLongModel):
 
             if len(egg_todo) > 0:
                 gym_ids = egg_todo[:]
-            elif (not isinstance(raidless, (bool)) and len(gym_ids) > raidless and isinstance(oldest_first, (bool))): 
+            elif (not isinstance(raidless, (bool)) and len(gym_ids) > raidless):
                 gym_ids = gym_ids[:raidless]
-                
+
             if len(queryDict) > 0 and geofences.is_enabled():
                 queryDict = geofences.get_geofenced_results(queryDict, geofence_name)
 
@@ -1119,9 +1122,13 @@ class Gym(LatLongModel):
                         'latitude': latitude,
                         'longitude': longitude,
                         'distance': distance,
-                        'key': key
+                        'key': key,
+                        'last_scanned': g['last_scanned'],
                     }
-            orderedgyms = OrderedDict(sorted(gyms.items(), key=lambda x: x[1]['distance']))
+            if oldest_first:
+                orderedgyms = OrderedDict(sorted(gyms.items(), key=lambda x: x[1]['last_scanned']))
+            else:
+                orderedgyms = OrderedDict(sorted(gyms.items(), key=lambda x: x[1]['distance']))
 
             newlat = 0
             newlong = 0
@@ -1144,7 +1151,8 @@ class Gym(LatLongModel):
                     result.append((value['latitude'], value['longitude'], value['key']))
                     newlat = value['latitude']
                     newlong = value['longitude']
-                orderedgyms = OrderedDict(sorted(orderedgyms.items(), key=lambda x: geopy.distance.vincenty((newlat, newlong), (x[1]['latitude'], x[1]['longitude'])).km))
+                if not oldest_first:
+                    orderedgyms = OrderedDict(sorted(orderedgyms.items(), key=lambda x: geopy.distance.vincenty((newlat, newlong), (x[1]['latitude'], x[1]['longitude'])).km))
 
         return result
 
@@ -1249,6 +1257,8 @@ class DeviceWorker(LatLongModel):
     fetching = Utf8mb4CharField(max_length=50, default='IDLE')
     scanning = SmallIntegerField(default=0)
     endpoint = Utf8mb4CharField(max_length=2000, default="")
+    requestedEndpoint = Utf8mb4CharField(max_length=2000, default="")
+    pogoversion = Utf8mb4CharField(max_length=10, default="")
 
     @staticmethod
     def get_by_id(id, latitude=0, longitude=0):
@@ -1274,7 +1284,8 @@ class DeviceWorker(LatLongModel):
                 'direction': 'U',
                 'fetching': 'IDLE',
                 'scanning': 0,
-                'endpoint': ''
+                'endpoint': '',
+                'pogoversion': ''
             }
         return result
 
@@ -1315,7 +1326,9 @@ class DeviceWorker(LatLongModel):
                              DeviceWorker.scans,
                              DeviceWorker.fetching,
                              DeviceWorker.scanning,
-                             DeviceWorker.endpoint)
+                             DeviceWorker.endpoint,
+                             DeviceWorker.requestedEndpoint,
+                             DeviceWorker.pogoversion)
                      .where((DeviceWorker.scanning == 1) |
                             (DeviceWorker.fetching != 'IDLE'))
                      .dicts())
@@ -1340,7 +1353,9 @@ class DeviceWorker(LatLongModel):
                              DeviceWorker.scans,
                              DeviceWorker.fetching,
                              DeviceWorker.scanning,
-                             DeviceWorker.endpoint)
+                             DeviceWorker.endpoint,
+                             DeviceWorker.requestedEndpoint,
+                             DeviceWorker.pogoversion)
                      .where(DeviceWorker.id == id)
                      .dicts())
 
@@ -1961,6 +1976,10 @@ class SpawnPoint(LatLongModel):
             lat2 = lat + 0.1
             lng1 = lng - 0.1
             lng2 = lng + 0.1
+
+            if geofence_name != "":
+                lat1, lng1, lat2, lng2 = geofences.get_boundary_coords(geofence_name)
+
             minlat = min(lat1, lat2)
             maxlat = max(lat1, lat2)
             minlng = min(lng1, lng2)
@@ -4262,6 +4281,11 @@ def database_migrate(db, old_ver):
         )
     if old_ver < 61:
         db.execute_sql('DROP TABLE `geofence`;')
+    if old_ver < 62:
+        migrate(
+            migrator.add_column('deviceworker', 'requestedEndpoint', Utf8mb4CharField(max_length=100, default="")),
+            migrator.add_column('deviceworker', 'pogoversion', Utf8mb4CharField(max_length=10, default=""))
+        )
 
     # Always log that we're done.
     log.info('Schema upgrade complete.')
